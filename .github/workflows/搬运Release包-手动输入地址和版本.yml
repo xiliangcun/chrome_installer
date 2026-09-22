@@ -1,44 +1,464 @@
-name: 一键搬运 Release（通用版）
+name: 一键搬运 Release（全功能通用版）
 
 on:
   workflow_dispatch:
     inputs:
       src_repo:
-        description: '源仓库（格式: owner/repo）'
+        description: "源仓库，格式：owner/repo"
         required: true
-        default: 'NanmiCoder/cc-haha'
+        default: "NanmiCoder/cc-haha"
+
+      copy_mode:
+        description: "搬运模式"
+        required: true
+        type: choice
+        default: "single"
+        options:
+          - single
+          - all
+          - date
+          - range
+
       tag:
-        description: '要搬运的 Release 版本号 / tag'
+        description: "单个版本号，仅 single 模式填写，例如：v0.1.1"
+        required: false
+        default: "v0.1.1"
+
+      start_date:
+        description: "开始日期，仅 date 模式填写，格式：2026-01-01"
+        required: false
+        default: ""
+
+      end_date:
+        description: "结束日期，仅 date 模式填写，格式：2026-12-31"
+        required: false
+        default: ""
+
+      from_tag:
+        description: "起始版本，仅 range 模式填写，例如：v0.1.0"
+        required: false
+        default: ""
+
+      to_tag:
+        description: "结束版本，仅 range 模式填写，例如：v0.2.0"
+        required: false
+        default: ""
+
+      overwrite_assets:
+        description: "目标 Release 存在同名附件时是否覆盖"
         required: true
-        default: 'v0.1.1'
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+      include_drafts:
+        description: "是否搬运草稿 Release，需要对源仓库有草稿读取权限"
+        required: true
+        type: choice
+        default: "false"
+        options:
+          - "false"
+          - "true"
+
+      include_prereleases:
+        description: "是否搬运预发布版本"
+        required: true
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
 
 jobs:
   copy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SRC_REPO: ${{ inputs.src_repo }}
+      COPY_MODE: ${{ inputs.copy_mode }}
+      SINGLE_TAG: ${{ inputs.tag }}
+      START_DATE: ${{ inputs.start_date }}
+      END_DATE: ${{ inputs.end_date }}
+      FROM_TAG: ${{ inputs.from_tag }}
+      TO_TAG: ${{ inputs.to_tag }}
+      OVERWRITE_ASSETS: ${{ inputs.overwrite_assets }}
+      INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
+      INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
+      TARGET_REPO: ${{ github.repository }}
 
     steps:
-      - name: 暴力搬运 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: 检查运行环境
+        shell: bash
         run: |
-          echo "开始搬运 ${{ inputs.src_repo }} 的 ${{ inputs.tag }} ..."
+          set -euo pipefail
 
-          # 下载源 Release 的 assets（没有 assets 也没关系）
-          gh release download ${{ inputs.tag }} -R ${{ inputs.src_repo }} -D ./out || true
+          echo "========================================"
+          echo "源仓库：${SRC_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "搬运模式：${COPY_MODE}"
+          echo "========================================"
 
-          # 获取源 Release 的真实标题和说明
-          TITLE=$(gh release view ${{ inputs.tag }} -R ${{ inputs.src_repo }} --json name --jq '.name' 2>/dev/null || echo "${{ inputs.tag }}")
-          BODY=$(gh release view ${{ inputs.tag }} -R ${{ inputs.src_repo }} --json body --jq '.body' 2>/dev/null || echo "从 ${{ inputs.src_repo }} 搬运而来")
+          gh --version
+          jq --version
 
-          # 如果目标仓库已有该 Release 就更新，否则创建
-          if gh release view ${{ inputs.tag }} --repo ${{ github.repository }} >/dev/null 2>&1; then
-            echo "Release 已存在，正在更新标题和说明..."
-            gh release edit ${{ inputs.tag }} --title "$TITLE" --notes "$BODY" --repo ${{ github.repository }}
-          else
-            echo "正在创建新 Release..."
-            gh release create ${{ inputs.tag }} ./out/* --title "$TITLE" --notes "$BODY" --repo ${{ github.repository }} || true
+          echo "检查源仓库访问权限..."
+          gh repo view "${SRC_REPO}" >/dev/null
+
+          echo "检查目标仓库访问权限..."
+          gh repo view "${TARGET_REPO}" >/dev/null
+
+      - name: 获取并筛选 Release
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASE_FILE="${RUNNER_TEMP}/all-releases.json"
+          SELECTED_FILE="${RUNNER_TEMP}/selected-releases.json"
+
+          echo "正在获取源仓库 Release 列表..."
+
+          gh release list \
+            --repo "${SRC_REPO}" \
+            --limit 1000 \
+            --order asc \
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease \
+            > "${RELEASE_FILE}"
+
+          TOTAL_COUNT="$(jq 'length' "${RELEASE_FILE}")"
+          echo "源仓库共获取到 ${TOTAL_COUNT} 个 Release"
+
+          if [ "${TOTAL_COUNT}" -eq 0 ]; then
+            echo "::error::源仓库没有可读取的 Release"
+            exit 1
           fi
 
-          echo "搬运完成！请刷新 Releases 页面查看。"
+          case "${COPY_MODE}" in
+            single)
+              if [ -z "${SINGLE_TAG}" ]; then
+                echo "::error::single 模式必须填写 tag"
+                exit 1
+              fi
+
+              jq \
+                --arg tag "${SINGLE_TAG}" \
+                '[.[] | select(.tagName == $tag)]' \
+                "${RELEASE_FILE}" > "${SELECTED_FILE}"
+              ;;
+
+            all)
+              cp "${RELEASE_FILE}" "${SELECTED_FILE}"
+              ;;
+
+            date)
+              if [ -z "${START_DATE}" ] || [ -z "${END_DATE}" ]; then
+                echo "::error::date 模式必须同时填写 start_date 和 end_date"
+                exit 1
+              fi
+
+              if ! date -d "${START_DATE}" >/dev/null 2>&1; then
+                echo "::error::开始日期格式错误：${START_DATE}"
+                exit 1
+              fi
+
+              if ! date -d "${END_DATE}" >/dev/null 2>&1; then
+                echo "::error::结束日期格式错误：${END_DATE}"
+                exit 1
+              fi
+
+              START_TS="$(date -u -d "${START_DATE} 00:00:00" '+%Y-%m-%dT%H:%M:%SZ')"
+              END_TS="$(date -u -d "${END_DATE} 23:59:59" '+%Y-%m-%dT%H:%M:%SZ')"
+
+              if [[ "${START_TS}" > "${END_TS}" ]]; then
+                echo "::error::开始日期不能晚于结束日期"
+                exit 1
+              fi
+
+              echo "日期范围：${START_TS} 至 ${END_TS}"
+
+              jq \
+                --arg start "${START_TS}" \
+                --arg end "${END_TS}" \
+                '[
+                  .[]
+                  | select(
+                      (.publishedAt // .createdAt) >= $start
+                      and
+                      (.publishedAt // .createdAt) <= $end
+                    )
+                ]' \
+                "${RELEASE_FILE}" > "${SELECTED_FILE}"
+              ;;
+
+            range)
+              if [ -z "${FROM_TAG}" ] || [ -z "${TO_TAG}" ]; then
+                echo "::error::range 模式必须同时填写 from_tag 和 to_tag"
+                exit 1
+              fi
+
+              FROM_INDEX="$(
+                jq \
+                  --arg tag "${FROM_TAG}" \
+                  'map(.tagName) | index($tag)' \
+                  "${RELEASE_FILE}"
+              )"
+
+              TO_INDEX="$(
+                jq \
+                  --arg tag "${TO_TAG}" \
+                  'map(.tagName) | index($tag)' \
+                  "${RELEASE_FILE}"
+              )"
+
+              if [ "${FROM_INDEX}" = "null" ]; then
+                echo "::error::找不到起始版本：${FROM_TAG}"
+                exit 1
+              fi
+
+              if [ "${TO_INDEX}" = "null" ]; then
+                echo "::error::找不到结束版本：${TO_TAG}"
+                exit 1
+              fi
+
+              if [ "${FROM_INDEX}" -gt "${TO_INDEX}" ]; then
+                TEMP_INDEX="${FROM_INDEX}"
+                FROM_INDEX="${TO_INDEX}"
+                TO_INDEX="${TEMP_INDEX}"
+
+                echo "检测到版本顺序相反，已自动交换起止范围"
+              fi
+
+              jq \
+                --argjson start "${FROM_INDEX}" \
+                --argjson end "${TO_INDEX}" \
+                '.[$start:($end + 1)]' \
+                "${RELEASE_FILE}" > "${SELECTED_FILE}"
+              ;;
+
+            *)
+              echo "::error::不支持的搬运模式：${COPY_MODE}"
+              exit 1
+              ;;
+          esac
+
+          if [ "${INCLUDE_DRAFTS}" != "true" ]; then
+            jq '[.[] | select(.isDraft == false)]' \
+              "${SELECTED_FILE}" > "${SELECTED_FILE}.tmp"
+
+            mv "${SELECTED_FILE}.tmp" "${SELECTED_FILE}"
+          fi
+
+          if [ "${INCLUDE_PRERELEASES}" != "true" ]; then
+            jq '[.[] | select(.isPrerelease == false)]' \
+              "${SELECTED_FILE}" > "${SELECTED_FILE}.tmp"
+
+            mv "${SELECTED_FILE}.tmp" "${SELECTED_FILE}"
+          fi
+
+          SELECTED_COUNT="$(jq 'length' "${SELECTED_FILE}")"
+
+          if [ "${SELECTED_COUNT}" -eq 0 ]; then
+            echo "::error::当前条件下没有找到需要搬运的 Release"
+            exit 1
+          fi
+
+          echo "========================================"
+          echo "即将搬运 ${SELECTED_COUNT} 个 Release："
+          echo "========================================"
+
+          jq -r '
+            .[]
+            | "版本：\(.tagName) | 日期：\(.publishedAt // .createdAt) | 草稿：\(.isDraft) | 预发布：\(.isPrerelease)"
+          ' "${SELECTED_FILE}"
+
+          {
+            echo "selected_file=${SELECTED_FILE}"
+            echo "selected_count=${SELECTED_COUNT}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: 搬运选中的 Release
+        shell: bash
+        env:
+          SELECTED_FILE: ${{ steps.select.outputs.selected_file }}
+          SELECTED_COUNT: ${{ steps.select.outputs.selected_count }}
+        run: |
+          set -euo pipefail
+
+          SUCCESS_COUNT=0
+          FAILED_COUNT=0
+          CURRENT_NUMBER=0
+
+          FAILED_FILE="${RUNNER_TEMP}/failed-releases.txt"
+          : > "${FAILED_FILE}"
+
+          copy_release() {
+            local tag="$1"
+            local current="$2"
+            local total="$3"
+
+            local work_dir
+            local asset_dir
+            local info_file
+            local title_file
+            local body_file
+            local title
+            local is_draft
+            local is_prerelease
+
+            work_dir="$(mktemp -d)"
+            asset_dir="${work_dir}/assets"
+            info_file="${work_dir}/release.json"
+            title_file="${work_dir}/title.txt"
+            body_file="${work_dir}/body.md"
+
+            mkdir -p "${asset_dir}"
+
+            echo ""
+            echo "=================================================="
+            echo "[${current}/${total}] 正在搬运：${tag}"
+            echo "=================================================="
+
+            if ! gh release view "${tag}" \
+              --repo "${SRC_REPO}" \
+              --json name,body,isDraft,isPrerelease,tagName,publishedAt \
+              > "${info_file}"; then
+              echo "::error::无法读取源 Release：${tag}"
+              rm -rf "${work_dir}"
+              return 1
+            fi
+
+            jq -r '.name // .tagName' "${info_file}" > "${title_file}"
+            jq -r '.body // ""' "${info_file}" > "${body_file}"
+
+            title="$(cat "${title_file}")"
+            is_draft="$(jq -r '.isDraft' "${info_file}")"
+            is_prerelease="$(jq -r '.isPrerelease' "${info_file}")"
+
+            echo "标题：${title}"
+            echo "草稿：${is_draft}"
+            echo "预发布：${is_prerelease}"
+
+            echo "正在下载附件..."
+
+            if gh release download "${tag}" \
+              --repo "${SRC_REPO}" \
+              --dir "${asset_dir}"; then
+              echo "附件下载完成"
+            else
+              echo "没有附件，或者附件下载失败，将继续创建 Release"
+            fi
+
+            if gh release view "${tag}" \
+              --repo "${TARGET_REPO}" \
+              >/dev/null 2>&1; then
+
+              echo "目标 Release 已存在，正在更新..."
+
+              EDIT_ARGS=(
+                release edit "${tag}"
+                --repo "${TARGET_REPO}"
+                --title "${title}"
+                --notes-file "${body_file}"
+              )
+
+              if [ "${is_draft}" = "true" ]; then
+                EDIT_ARGS+=(--draft)
+              else
+                EDIT_ARGS+=(--draft=false)
+              fi
+
+              if [ "${is_prerelease}" = "true" ]; then
+                EDIT_ARGS+=(--prerelease)
+              else
+                EDIT_ARGS+=(--prerelease=false)
+              fi
+
+              gh "${EDIT_ARGS[@]}"
+            else
+              echo "目标 Release 不存在，正在创建..."
+
+              CREATE_ARGS=(
+                release create "${tag}"
+                --repo "${TARGET_REPO}"
+                --title "${title}"
+                --notes-file "${body_file}"
+              )
+
+              if [ "${is_draft}" = "true" ]; then
+                CREATE_ARGS+=(--draft)
+              fi
+
+              if [ "${is_prerelease}" = "true" ]; then
+                CREATE_ARGS+=(--prerelease)
+              fi
+
+              gh "${CREATE_ARGS[@]}"
+            fi
+
+            mapfile -d '' ASSETS < <(
+              find "${asset_dir}" \
+                -maxdepth 1 \
+                -type f \
+                -print0
+            )
+
+            if [ "${#ASSETS[@]}" -gt 0 ]; then
+              echo "正在上传 ${#ASSETS[@]} 个附件..."
+
+              UPLOAD_ARGS=(
+                release upload "${tag}"
+                --repo "${TARGET_REPO}"
+              )
+
+              if [ "${OVERWRITE_ASSETS}" = "true" ]; then
+                UPLOAD_ARGS+=(--clobber)
+              fi
+
+              UPLOAD_ARGS+=("${ASSETS[@]}")
+
+              gh "${UPLOAD_ARGS[@]}"
+            else
+              echo "该 Release 没有附件"
+            fi
+
+            rm -rf "${work_dir}"
+
+            echo "Release ${tag} 搬运完成"
+          }
+
+          while IFS= read -r TAG; do
+            CURRENT_NUMBER=$((CURRENT_NUMBER + 1))
+
+            if copy_release "${TAG}" "${CURRENT_NUMBER}" "${SELECTED_COUNT}"; then
+              SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "${TAG}" >> "${FAILED_FILE}"
+              echo "::warning::Release ${TAG} 搬运失败，继续处理下一个版本"
+            fi
+          done < <(jq -r '.[].tagName' "${SELECTED_FILE}")
+
+          echo ""
+          echo "=================================================="
+          echo "Release 搬运执行完成"
+          echo "=================================================="
+          echo "总数量：${SELECTED_COUNT}"
+          echo "成功：${SUCCESS_COUNT}"
+          echo "失败：${FAILED_COUNT}"
+
+          if [ "${FAILED_COUNT}" -gt 0 ]; then
+            echo ""
+            echo "失败的 Release："
+            cat "${FAILED_FILE}"
+
+            echo "::error::有 ${FAILED_COUNT} 个 Release 搬运失败"
+            exit 1
+          fi
+
+          echo "全部 Release 搬运成功，请刷新目标仓库 Releases 页面查看。"
